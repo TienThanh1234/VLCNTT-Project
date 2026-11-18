@@ -1,4 +1,6 @@
+import { physicalError } from './physical-protocol.js';
 export const STALE_MS = 4000;
+export function payloadError(type, data) { return data?.schema_version===2 ? physicalError(type,data) : validPayload(type,data) ? null : 'invalid_schema_or_payload'; }
 
 export function validEnvelope(data)
 {
@@ -11,6 +13,7 @@ export function validEnvelope(data)
 
 export function validPayload(type, data)
 {
+    if(data?.schema_version===2) return physicalError(type,data)===null;
     if (!validEnvelope(data))
     {
         return false;

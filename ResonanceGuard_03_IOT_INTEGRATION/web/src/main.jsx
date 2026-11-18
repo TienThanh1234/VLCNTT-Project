@@ -53,6 +53,8 @@ function App()
     const acksRef = useRef(new AckBuffer());
     const feedbackRef = useRef(null);
     const bootRef = useRef(null);
+    const socketIdRef=useRef(null);
+    const physicalRef=useRef(false);
     const healthRef = useRef(new ConnectionHealth());
     const stale = !lastStateAt || clock - lastStateAt > 4000 || !wsReady || !model.broker_connected || model.broker_subscribed === false;
     const rpmReading = latestReading(model.history, 'telemetry/rpm', model.state?.boot_id, clock, !stale);
@@ -82,6 +84,7 @@ function App()
             return;
         }
         acksRef.current.take(ack.command_id, sessionRef.current.epoch);
+        if(record.action==='arm' && ack.accepted && healthy) command('start', false, true);
         if (!record.silent || !ack.accepted)
         {
             setMessage(`ESP ${ack.accepted ? 'chấp nhận' : 'từ chối'}: ${ack.reason} · ${ack.command_id.slice(0, 8)}${healthy ? '' : ' · Kết nối/state không mới: không renew'}`);
@@ -119,9 +122,10 @@ function App()
         catch { /* Recovery is read-only and optional; the existing timeout still disarms. */ }
     }
 
-    async function command(action, silent = false)
+    async function command(action, silent = false, armed = false)
     {
-        if (action === 'stop' || action === 'start')
+        if(action==='start' && physicalRef.current && !armed) action='arm';
+        if (action === 'stop' || action === 'arm' || (action === 'start' && !armed))
         {
             disarm();
         }
@@ -135,7 +139,7 @@ function App()
             const response = await fetch('/api/motor', {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 signal: AbortSignal.timeout(5000),
-                body: JSON.stringify({ action, duty: requestedDuty })
+                body: JSON.stringify({ action, duty: requestedDuty, socket_id:socketIdRef.current })
             });
             const data = await response.json();
             if (!response.ok)
@@ -198,6 +202,9 @@ function App()
             socket.onmessage = event =>
             {
                 const row = JSON.parse(event.data);
+                if(row.type==='control_socket'){socketIdRef.current=row.data.id;return;}
+                if(row.type==='state')physicalRef.current=row.data.schema_version===2;
+                if(row.type==='snapshot')physicalRef.current=row.data.state?.schema_version===2;
                 if (row.type === 'snapshot')
                 {
                     healthRef.current.snapshot(row.data);
@@ -238,6 +245,7 @@ function App()
             };
         }
         connect();
+        const heartbeat=setInterval(()=>{if(socket?.readyState===1)socket.send(JSON.stringify({type:'heartbeat'}));},500);
         const ticker = setInterval(() => setClock(Date.now()), 500);
         const renew = setInterval(() =>
         {
@@ -274,16 +282,17 @@ function App()
                 }
                 return;
             }
-            if (sessionRef.current.active)
+            if (sessionRef.current.active && sessionRef.current.pending.size===0)
             {
                 command('renew', true);
             }
-        }, 1000);
+        }, 500);
         return () =>
         {
             disposed = true;
             clearTimeout(retry);
             clearInterval(ticker);
+            clearInterval(heartbeat);
             clearInterval(renew);
             socket?.close();
         };
@@ -324,7 +333,7 @@ function App()
                 dutyRef.current = value;
                 setDuty(value);
             }} /></label>
-            <div className="buttons"><button disabled={stale || !model.broker_connected} onClick={() => command('start')}>START</button>
+            <div className="buttons"><button disabled={stale || !model.broker_connected || (model.state?.schema_version===2 && (!model.state.safety_ready || !model.state.imu_ok || !model.physical_control_enabled))} onClick={() => command('start')}>START</button>
                 <button onClick={() => command('stop')}>STOP</button>
                 <button disabled={stale || !model.state?.running} onClick={() => command('set_duty')}>Áp dụng PWM</button>
                 <button onClick={exportCsv}>Xuất CSV</button></div>

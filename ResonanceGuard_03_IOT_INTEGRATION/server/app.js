@@ -4,10 +4,13 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, createWriteStream } from 'node:fs';
-import { STALE_MS, validPayload } from './protocol.js';
+import { STALE_MS, validPayload, payloadError } from './protocol.js';
 import { SpectrumMonitor } from './spectrum.js';
+import { cleanBlock, blockSamples } from './physical-protocol.js';
+import { RunStore } from './storage.js';
+import { PhysicalControl, privateBroker } from './physical-control.js';
 
-export function createDemo({ url, prefix, logDirectory = 'data', now = Date.now, onTrace = null })
+export function createDemo({ url, prefix, logDirectory = 'data', now = Date.now, onTrace = null, username, password, aclConfirmed = false })
 {
     if (!prefix || /[+#]/.test(prefix) || prefix.includes('CHANGE_THIS'))
     {
@@ -19,6 +22,7 @@ export function createDemo({ url, prefix, logDirectory = 'data', now = Date.now,
     const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 4096,
         verifyClient: (info, done) => done(allowedOrigin(info.origin), 403, 'Origin rejected') });
     const client = mqtt.connect(url, {
+        username, password,
         clientId: `rg-be-${randomUUID()}`, reconnectPeriod: 2000,
         clean: true, queueQoSZero: false, connectTimeout: 10000,
         // This handler subscribes explicitly and waits for its SUBACK on every connection.
@@ -26,6 +30,7 @@ export function createDemo({ url, prefix, logDirectory = 'data', now = Date.now,
     });
     mkdirSync(logDirectory, { recursive: true });
     const spectrum = new SpectrumMonitor(logDirectory, now);
+    const store = new RunStore(logDirectory, now);
     const log = createWriteStream(`${logDirectory}/telemetry-${Date.now()}.jsonl`, { flags: 'a' });
     log.on('error', (error) => console.error('LOG ERROR', error.message));
     const diagnostics = createWriteStream(`${logDirectory}/diagnostics-${Date.now()}.jsonl`, { flags: 'a' });
@@ -48,14 +53,20 @@ export function createDemo({ url, prefix, logDirectory = 'data', now = Date.now,
     const mqttConfig = { protocol: endpoint.protocol.replace(':', ''), host: endpoint.hostname,
         port: Number(endpoint.port || (endpoint.protocol === 'mqtts:' ? 8883 : 1883)),
         client_id: client.options.clientId, pid: process.pid };
-    const topics = ['state', 'telemetry/vibration', 'telemetry/rpm', 'ack'].map(s => `${prefix}/${s}`);
-    const topicTypes = new Map(topics.map((topic, i) => [topic, ['state', 'telemetry/vibration', 'telemetry/rpm', 'ack'][i]]));
+    const types = ['state', 'telemetry/vibration', 'telemetry/rpm', 'ack', 'availability', 'telemetry/vibration_block'];
+    const topics = types.map(s => `${prefix}/${s}`);
+    const topicTypes = new Map(topics.map((topic, i) => [topic, types[i]]));
+    const physical = new PhysicalControl({now,state:()=>state,secure:privateBroker(url,username,password,aclConfirmed),
+        save:record=>{commands.set(record.command_id,record);pending.set(record.command_id,record);store.command(record);},
+        publish:command=>{if(client.connected&&subscribed)client.publish(`${prefix}/cmd/motor`,JSON.stringify(command),{qos:1,retain:false});}});
+    const controlTimer=setInterval(()=>physical.tick(),100);
+    let lastBlock=null;
     const ingest = { received: 0, accepted: {}, dropped: 0, drop_reasons: {}, last_message: null, last_drop: null };
     let diagnosticBytes = 0;
     const sampledAt = new Map();
     const trace = (stage, details = {}) =>
     {
-        const entry = { at: now(), source: 'synthetic', stage, ...details };
+        const entry = { at: now(), source: state?.source??'unknown', stage, ...details };
         const record = commands.get(details.command_id);
         if (record)
         {
@@ -92,6 +103,7 @@ export function createDemo({ url, prefix, logDirectory = 'data', now = Date.now,
         state, state_age_ms: stateAt ? now() - stateAt : null,
         stale: !client.connected || !subscribed || !stateAt || now() - stateAt > STALE_MS,
         last_ack: lastAck, history,
+        physical_control_enabled: physical.secure, active_run:store.active,
         streams: Object.fromEntries(Object.entries(streams).map(([type, row]) => [type, {
             age_ms: now() - row.received_at,
             stale: !client.connected || now() - row.received_at > STALE_MS
@@ -134,7 +146,7 @@ export function createDemo({ url, prefix, logDirectory = 'data', now = Date.now,
             {
                 return;
             }
-            subscribed = !error && grants?.length === 4 && grants.every(grant => grant.qos !== 128);
+            subscribed = !error && grants?.length === topics.length && grants.every(grant => grant.qos !== 128);
             trace('MQTT_SUBACK', { connection, ready: subscribed, error: error?.code ?? null, grants });
             broadcast({ type: 'snapshot', data: snapshot() });
         });
@@ -158,6 +170,7 @@ export function createDemo({ url, prefix, logDirectory = 'data', now = Date.now,
     };
     const invalidate = () =>
     {
+        physical.revoke('mqtt_disconnect');store.issue('mqtt_disconnect');lastBlock=null;
         spectrum.reset('MQTT mất kết nối');
         stateAt = 0;
         subscribed = false;
@@ -230,7 +243,7 @@ export function createDemo({ url, prefix, logDirectory = 'data', now = Date.now,
                 bytes: bytes.length, qos: packet.qos });
         }
         // Optional timestamped batches share the vibration topic; legacy packets keep their schema.
-        if (type === 'telemetry/vibration' && data?.samples !== undefined)
+        if (type === 'telemetry/vibration' && data?.schema_version===1 && data?.samples !== undefined)
         {
             if (!client.connected || !subscribed || !stateAt || now() - stateAt > STALE_MS ||
                 data.schema_version !== 1 || data.device_id !== 'rg01' || data.boot_id !== state?.boot_id || retiredBoots.has(data.boot_id) ||
@@ -244,7 +257,7 @@ export function createDemo({ url, prefix, logDirectory = 'data', now = Date.now,
         }
         if (!validPayload(type, data) || retiredBoots.has(data.boot_id))
         {
-            drop(!validPayload(type, data) ? 'invalid_schema_or_payload' : 'retired_boot');
+            drop(!validPayload(type, data) ? payloadError(type,data) : 'retired_boot');
             return;
         }
         if (type !== 'state' && data.boot_id !== state?.boot_id)
@@ -252,6 +265,8 @@ export function createDemo({ url, prefix, logDirectory = 'data', now = Date.now,
             drop('wrong_current_boot');
             return;
         }
+        if(data.schema_version===2&&type!=='state'&&type!=='availability'&&(!stateAt||now()-stateAt>STALE_MS||Math.abs(data.t_device_ms-(state.t_device_ms+now()-stateAt))>STALE_MS)) {drop('stale_device_timestamp');store.issue('stale_telemetry');return;}
+        if(type!=='state'&&data.source!==state?.source){drop('source_changed_without_boot');return;}
         const record = type === 'ack' ? pending.get(data.command_id) : null;
         if (type === 'ack' && (!record || record.boot_id !== data.boot_id || now() - record.created_at > 5000))
         {
@@ -267,6 +282,7 @@ export function createDemo({ url, prefix, logDirectory = 'data', now = Date.now,
         }
         if (type === 'state' && state && data.boot_id !== state.boot_id)
         {
+            physical.revoke('boot_changed');store.issue('boot_changed');lastBlock=null;
             spectrum.reset('Thiết bị khởi động lại');
             retiredBoots.add(state.boot_id);
             if (retiredBoots.size > 32)
@@ -292,6 +308,7 @@ export function createDemo({ url, prefix, logDirectory = 'data', now = Date.now,
             accepted.delete(accepted.keys().next().value);
         }
         const event = { type, data, received_at: now() };
+        if(type==='ack'&&data.schema_version===2&&!physical.acknowledge(data)){drop('session_nonce_or_ack_timeout');return;}
         if (type === 'state')
         {
             if (state && state.boot_id === data.boot_id && lastStateReceivedAt)
@@ -319,7 +336,26 @@ export function createDemo({ url, prefix, logDirectory = 'data', now = Date.now,
             trace('ACK_ACCEPT', { command_id: data.command_id, boot_id: data.boot_id,
                 age_ms: now() - record.created_at, accepted: data.accepted, running: data.running });
             pending.delete(data.command_id);
+            store.command(record);
         }
+        if(type==='availability'&&!data.online){stateAt=0;physical.revoke('device_offline');store.issue('device_offline');spectrum.reset('Device offline');}
+        if(type==='telemetry/vibration_block') {
+            const identity=JSON.stringify([data.boot_id,data.run_id,data.config_id]);
+            if(lastBlock?.identity===identity&&data.block_seq<=lastBlock.seq){drop('duplicate_block_seq');return;}
+            if(lastBlock?.identity===identity&&(data.block_seq!==lastBlock.seq+1||Math.abs(data.t0_device_us-lastBlock.end)>500)) {
+                data.quality.gap=true;store.issue('block_gap');spectrum.reset('Block gap');
+            }
+            lastBlock={identity,seq:data.block_seq,end:data.t0_device_us+data.samples.length*data.sample_period_us};
+            const config=store.getConfig(data.config_id);
+            if(cleanBlock(data)&&config) {
+                try{spectrum.ingest({source:'measured',boot_id:data.boot_id,seq:data.block_seq,unit:data.unit,axis:config.axis,mode:'steady',quality:'valid',sample_rate:200,
+                    sensorPosition:config.sensor_position,rulerLength:config.length_mm,filter:'MPU6050 DLPF3 ±4g',run_id:data.run_id,config_id:data.config_id,samples:blockSamples(data,config.axis)});}catch(error){spectrum.reset(error.message);store.issue('spectrum_gap');}
+            }else spectrum.reset(config?'Block quality invalid':'Mechanical config required');
+            const [ax,ay,az]=data.samples.at(-1);
+            const display={type:'telemetry/vibration',data:{...data,samples:undefined,ax,ay,az,quality:cleanBlock(data)?'ok':'invalid_block'},received_at:now()};
+            history.push(display);broadcast(display);
+        }
+        try {store.ingest(event);} catch(error){physical.revoke('storage_error');store.issue('storage_error');drop('storage_error');return;}
         if (type.startsWith('telemetry/'))
         {
             streams[type] = event;
@@ -338,7 +374,13 @@ export function createDemo({ url, prefix, logDirectory = 'data', now = Date.now,
             trace('ACK_WS_SEND', { command_id: data.command_id, ...delivered });
         }
     });
-    wss.on('connection', socket => socket.send(JSON.stringify({ type: 'snapshot', data: snapshot() })));
+    wss.on('connection', socket => {
+        const key=physical.socket(socket);
+        socket.send(JSON.stringify({type:'control_socket',data:{id:key}}));
+        socket.send(JSON.stringify({ type: 'snapshot', data: snapshot() }));
+        socket.on('message',bytes=>{try{if(JSON.parse(bytes).type==='heartbeat')physical.heartbeat(key);}catch{}});
+        socket.on('close',()=>physical.disconnect(key));
+    });
     app.use((req, res, next) =>
     {
         const origin = req.get('origin');
@@ -350,6 +392,27 @@ export function createDemo({ url, prefix, logDirectory = 'data', now = Date.now,
     });
     app.use(express.json({ limit: '4kb' }));
     app.get('/api/state', (req, res) => res.json(snapshot()));
+    app.get('/api/configs',(req,res)=>res.json(store.configs()));
+    app.post('/api/configs',(req,res)=>res.status(201).json(store.config(req.body)));
+    app.get('/api/runs',(req,res)=>res.json(store.list()));
+    app.post('/api/runs',(req,res)=>{
+        if(!stateAt||now()-stateAt>STALE_MS||!client.connected||!subscribed) return res.status(409).json({error:'fresh_physical_state_required'});
+        if(state.running)return res.status(409).json({error:'stop_motor_before_configuring_run'});
+        const r=store.create(req.body,state,streams['telemetry/rpm']&&now()-streams['telemetry/rpm'].received_at<1000?streams['telemetry/rpm'].data:null);
+        const record=physical.send('configure',0,null,{run_id:r.id,config_id:r.config_id});
+        res.status(201).json({...r,configure_command_id:record.command_id});
+    });
+    app.get('/api/runs/:id',(req,res)=>{const r=store.get(req.params.id);res.status(r?200:404).json(r??{error:'run_not_found'});});
+    app.post('/api/runs/:id/finish',(req,res)=>res.json(store.finish(req.params.id)));
+    app.post('/api/runs/:id/steps',(req,res)=>{if(store.active?.id!==req.params.id||!stateAt||now()-stateAt>1000)throw Error('fresh_active_run_required');res.json(store.step(req.body,state.t_device_ms));});
+    app.get('/api/runs/:id/raw',(req,res)=>{if(!store.get(req.params.id))return res.status(404).json({error:'run_not_found'});res.download(store.rawPath(req.params.id));});
+    app.get('/api/runs/:id/replay',(req,res)=>res.json({source:'recorded',live:false,rows:store.rows(req.params.id)}));
+    app.get('/api/runs/:id/analysis',(req,res)=>res.json(store.results(req.params.id)));
+    app.post('/api/runs/:id/analysis',(req,res)=>res.json(store.analyze(req.params.id)));
+    app.get('/api/configs/:id/estimate',(req,res)=>res.json(store.estimate(req.params.id)));
+    app.get('/api/baselines',(req,res)=>res.json(store.baselines()));
+    app.post('/api/baselines',(req,res)=>res.status(201).json(store.baseline(req.body)));
+    app.post('/api/compare',(req,res)=>res.json(store.compare(req.body)));
     app.get('/api/spectrum', (req, res) => res.json(spectrum.snapshot()));
     app.post('/api/spectrum/config', (req, res) => { spectrum.save(req.body); res.json(spectrum.snapshot()); });
     app.post('/api/spectrum/restore', (req, res) => { spectrum.restore(); res.json(spectrum.snapshot()); });
@@ -374,12 +437,18 @@ export function createDemo({ url, prefix, logDirectory = 'data', now = Date.now,
     });
     app.get('/api/commands/:id', (req, res) =>
     {
-        const record = commands.get(req.params.id);
+        const record = commands.get(req.params.id)??store.getCommand(req.params.id);
         res.status(record ? 200 : 404).json(record ?? { error: 'Command not in recent 100 records; inspect diagnostics JSONL' });
     });
     app.post('/api/motor', (req, res) =>
     {
         const { action, duty } = req.body ?? {};
+        if(state?.schema_version===2) {
+            if(!client.connected||!subscribed)return res.status(503).json({error:'Broker offline'});
+            if(action!=='stop'&&(!stateAt||now()-stateAt>1000))return res.status(409).json({error:'Physical state stale'});
+            try{const r=physical.request(action,duty,req.body.socket_id);return res.status(202).json({status:'sent_waiting_for_device_ack',command_id:r.command_id});}
+            catch(error){return res.status(409).json({error:error.message});}
+        }
         if (!['start', 'stop', 'renew', 'set_duty'].includes(action) ||
             (action !== 'stop' && (!Number.isFinite(duty) || duty < 0 || duty > 0.8)))
         {
@@ -397,11 +466,12 @@ export function createDemo({ url, prefix, logDirectory = 'data', now = Date.now,
             schema_version: 1, device_id: 'rg01', source: 'synthetic',
             boot_id: state?.boot_id ?? '', command_id: randomUUID(),
             action, duty: action === 'stop' ? 0 : duty,
-            lease_ms: 4000,
+            lease_ms: 2000,
             not_after_device_ms: ((state?.t_device_ms ?? 0) + 3000) >>> 0
         };
         const record = { command_id: command.command_id, action, duty: command.duty, boot_id: command.boot_id, created_at: now(), trace: [] };
         pending.set(command.command_id, record);
+        store.command(record);
         commands.set(command.command_id, record);
         trace('COMMAND_TX', { command_id: command.command_id, boot_id: command.boot_id,
             action, duty: command.duty, pwm_requested: Math.round(command.duty * 255), device_deadline_ms: command.not_after_device_ms, lease_ms: command.lease_ms });
@@ -432,6 +502,7 @@ export function createDemo({ url, prefix, logDirectory = 'data', now = Date.now,
         server, client,
         async close()
         {
+            clearInterval(controlTimer);physical.revoke('backend_shutdown');
             for (const socket of wss.clients)
             {
                 socket.terminate();
@@ -441,6 +512,7 @@ export function createDemo({ url, prefix, logDirectory = 'data', now = Date.now,
             await new Promise(resolve => log.end(resolve));
             await new Promise(resolve => diagnostics.end(resolve));
             await new Promise(resolve => server.close(resolve));
+            store.close();
         }
     };
 }

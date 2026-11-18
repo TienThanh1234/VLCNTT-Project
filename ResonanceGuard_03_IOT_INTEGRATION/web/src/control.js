@@ -47,6 +47,7 @@ export class ControlSession
         this.pending.delete(ack.command_id);
         this.completed.set(ack.command_id, true);
         if (this.completed.size > 100) this.completed.delete(this.completed.keys().next().value);
+        if(record.action==='arm' && ack.accepted && healthy && !ack.running){this.active=false;this.lastAckDecision='arm_ack_waiting_start';return record;}
         if (!ack.accepted || !ack.running || !healthy)
         {
             this.active = false;

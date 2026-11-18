@@ -62,9 +62,9 @@ export class SpectrumMonitor {
     }
     ingest(batch) {
         if(batch && (!(batch.sample_rate>=20 && batch.sample_rate<=1000) || batch.source==='measured_live' && (typeof batch.filter!=='string' || !batch.filter))) fail('Thiếu Fs hoặc cấu hình lọc cảm biến thật');
-        if(!batch||!['synthetic','measured_live'].includes(batch.source)||batch.unit!=='m/s2'||!['ax','ay','az'].includes(batch.axis)||!['steady','ringdown','forced'].includes(batch.mode)||typeof batch.boot_id!=='string'||!batch.boot_id||!Number.isSafeInteger(batch.seq)||batch.seq<0||!Number.isFinite(batch.sample_rate)||!Array.isArray(batch.samples)||batch.samples.length<1||batch.samples.length>40||typeof batch.sensorPosition!=='string'||!batch.sensorPosition||!Number.isFinite(batch.rulerLength)||batch.rulerLength<=0||batch.quality!=='valid') fail('Batch/schema không hợp lệ (1–40 mẫu)');
-        const identity=JSON.stringify([batch.source,batch.boot_id,batch.axis,batch.mode,batch.sample_rate,batch.sensorPosition,batch.rulerLength,batch.filter??null]);
-        const streamKey=JSON.stringify([batch.source,batch.boot_id]);
+        if(!batch||!['synthetic','measured','measured_live'].includes(batch.source)||batch.unit!=='m/s2'||!['ax','ay','az'].includes(batch.axis)||!['steady','ringdown','forced'].includes(batch.mode)||typeof batch.boot_id!=='string'||!batch.boot_id||!Number.isSafeInteger(batch.seq)||batch.seq<0||!Number.isFinite(batch.sample_rate)||!Array.isArray(batch.samples)||batch.samples.length<1||batch.samples.length>40||typeof batch.sensorPosition!=='string'||!batch.sensorPosition||!Number.isFinite(batch.rulerLength)||batch.rulerLength<=0||batch.quality!=='valid') fail('Batch/schema không hợp lệ (1–40 mẫu)');
+        const identity=JSON.stringify([batch.source,batch.boot_id,batch.run_id,batch.config_id,batch.axis,batch.mode,batch.sample_rate,batch.sensorPosition,batch.rulerLength,batch.filter??null]);
+        const streamKey=JSON.stringify([batch.source,batch.boot_id,batch.run_id,batch.config_id]);
         const seen=this.seen.get(streamKey);
         if(seen && (batch.seq<=seen.seq || batch.samples[0]?.t_ms<=seen.time)) fail('Batch trùng hoặc sai thứ tự');
         const interrupted=this.identity!==identity||!this.at||this.now()-this.at>4000;
